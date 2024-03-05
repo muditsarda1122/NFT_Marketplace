@@ -92,6 +92,7 @@ module overmind::marketplace {
         @param item_count - The number of items in the shop. Including items that are not listed or 
             sold out.
     */
+    // shared object, shopowner has the ownership of shop owner capability
 	struct Shop has key {
 		id: UID,
         shop_owner_cap: ID,
@@ -127,6 +128,7 @@ module overmind::marketplace {
         @param available - The available supply of the item. Will be less than or equal to the total
             supply and will start at the total supply and decrease as items are purchased.
     */
+    //before a user buys an item, we need to make sure that 'listed' is set to true.
     struct Item has store {
 		id: u64,
 		title: String,
@@ -219,7 +221,34 @@ module overmind::marketplace {
         @param ctx - The transaction context.
 	*/
 	public fun create_shop(recipient: address, ctx: &mut TxContext) {
-        
+        let shop_id: UID = object::new(ctx);
+        let shop_id_ID: ID = object::uid_to_inner(&shop_id);
+
+        let shop_owner_cap_id: UID = object::new(ctx);
+        let shop_owner_cap_id_ID: ID = object::uid_to_inner(&shop_owner_cap_id);
+
+        // emit event
+        event::emit(ShopCreated {
+            shop_id: shop_id_ID,
+            shop_owner_cap_id: shop_owner_cap_id_ID
+        });
+
+        // create ShopOwnerCapability struct and transfer to recipient
+        let shopOwnerCapability: ShopOwnerCapability = ShopOwnerCapability {
+            id: shop_owner_cap_id,
+            shop: shop_id_ID
+        };
+        transfer::transfer(shopOwnerCapability, recipient);
+
+        // create new shop and share it
+        let shop: Shop = Shop {
+            id: shop_id,
+            shop_owner_cap: shop_owner_cap_id_ID,
+		    balance: balance::zero(),
+		    items: vector::empty(),
+            item_count: 0
+        };
+        transfer::share_object(shop);
 	}
 
     /*
@@ -245,7 +274,37 @@ module overmind::marketplace {
         supply: u64, 
         category: u8
     ) {
-        
+        // ensure that the id of shop_owner_cap matches shop's shop_owner_cap, error 1
+        assert!(object::uid_to_inner(&shop_owner_cap.id) == shop.shop_owner_cap, ENotShopOwner);
+
+        // ensure price > 0, error 6
+        assert!(price > 0, EInvalidPrice);
+
+        // ensure supply > 0, error 7
+        assert!(supply > 0, EInvalidSupply);
+
+        // make new item struct
+        let item: Item = Item {
+            id: vector::length(&shop.items),
+            title: string::utf8(title),
+            description: string::utf8(description),
+            price,
+            url: url::new_unsafe_from_bytes(url),
+            listed: true,
+            category,
+            total_supply: supply,
+            available: supply
+        };
+
+        // emit event 
+        event::emit(ItemAdded {
+            shop_id: object::uid_to_inner(&shop.id),
+            item: vector::length(&shop.items) + 1
+        });
+
+        // update items vector and item_count in shop struct
+        vector::push_back(&mut shop.items, item);
+        shop.item_count = shop.item_count + supply; // or should this be shop.item_count ++ ?
     }
 
     /*
@@ -260,7 +319,21 @@ module overmind::marketplace {
         shop_owner_cap: &ShopOwnerCapability,
         item_id: u64
     ) {
-        
+        // ensure that shop_owner_cap id matches the shop's shop_owner_cap id
+        assert!(object::uid_to_inner(&shop_owner_cap.id) == shop.shop_owner_cap, ENotShopOwner);
+
+        // ensure item id is valid
+        assert!(item_id <= vector::length(&shop.items), EInvalidItemId);
+
+        // unlist the item
+        let item_to_be_unlisted: &mut Item = vector::borrow_mut(&mut shop.items, item_id);
+        item_to_be_unlisted.listed = false;
+
+        // emit event 
+        event::emit(ItemUnlisted {
+            shop_id: object::uid_to_inner(&shop.id),
+            item_id
+        });
     }
 
     /*
@@ -282,7 +355,61 @@ module overmind::marketplace {
         payment_coin: &mut coin::Coin<SUI>,
         ctx: &mut TxContext
     ) {
+        // abort if item id is invalid
+        assert!(item_id <= vector::length(&shop.items), EInvalidItemId);
 
+        let item: &mut Item = vector::borrow_mut(&mut shop.items, item_id);
+
+        // abort if shop does not have enough supply
+        assert!(item.available >= quantity, EInvalidQuantity);
+
+        // abort if payment coin is insufficient
+        let immutable_payment_coin: &coin::Coin<SUI> = payment_coin;
+        let coin_value: u64 = coin::value(immutable_payment_coin);
+        assert!(coin_value >= (item.price * quantity), EInsufficientPayment);
+
+        // abort if item is unlisted
+        assert!(item.listed == true, EItemIsNotListed);
+
+        // cut balance from payment coin and add to balance of shop
+        let payment_coin_balance: &mut Balance<SUI> = coin::balance_mut(payment_coin);
+        let balance_to_add_to_shop: Balance<SUI> = balance::split(payment_coin_balance, item.price * quantity);
+        balance::join(&mut shop.balance, balance_to_add_to_shop);
+
+        // create a PurchasedItem struct and send to recipient
+        let i = 0;
+        while(i < quantity){
+            let receipt: PurchasedItem = PurchasedItem {
+                id: object::new(ctx),
+                shop_id: object::uid_to_inner(&shop.id), 
+                item_id
+            };
+            transfer::transfer(receipt, recipient);
+
+            i = i + 1;
+        };
+
+        // emit ItemPurchased
+        event::emit(ItemPurchased {
+            shop_id: object::uid_to_inner(&shop.id),
+            item_id, 
+            quantity,
+            buyer: recipient,
+        });
+
+        // reduce available amount of item
+        item.available = item.available - quantity;
+
+        // if last item was bought then emit ItemUnlisted
+        let updated_item: &mut Item = vector::borrow_mut(&mut shop.items, item_id);
+        if(updated_item.available == 0) {
+            updated_item.listed = false;
+
+            event::emit(ItemUnlisted {
+                shop_id: object::uid_to_inner(&shop.id),
+                item_id,   
+            });
+        }
     }
 
     /*
@@ -301,7 +428,24 @@ module overmind::marketplace {
         recipient: address,
         ctx: &mut TxContext
     ) {
-        
+        // ensure that shop owner capability matches the shop
+        assert!(object::uid_to_inner(&shop_owner_cap.id) == shop.shop_owner_cap, ENotShopOwner);
+
+        // ensure that the amount is correct
+        let shop_balance_value: u64 = balance::value(&shop.balance);
+        assert!(shop_balance_value >= amount, EInvalidWithdrawalAmount);
+
+        // withdraw the SUI and update the balance in shop and transfer it to recipient
+        let balance_to_transfer: Balance<SUI> = balance::split(&mut shop.balance, amount);
+        let coin_to_transfer: coin::Coin<SUI> = coin::from_balance(balance_to_transfer, ctx);
+        transfer::public_transfer(coin_to_transfer, recipient);
+
+        // emit event 
+        event::emit(ShopWithdrawal {
+            shop_id: object::uid_to_inner(&shop.id),
+            amount,
+            recipient,
+        });
     }
 
     //==============================================================================================
